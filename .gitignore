@@ -1,0 +1,6 @@
+config.py
+*.log
+*.db
+*.csv
+__pychache__
+__pycache__/
