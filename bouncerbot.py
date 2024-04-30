@@ -208,6 +208,8 @@ async def request_invite_link(update: Update, context: CallbackContext) -> str:
         response_text = "Currently, there is no active chat to link to. Please check back later."
     else:
         response_text = f"Here is your one-time invite link: {invite_link}"
+        if MINUTES_TO_LINK_EXPIRATION:
+            response_text += f"\n\nThis link will expire in {MINUTES_TO_LINK_EXPIRATION} minutes."
 
     # Send the invite link to the user
     await context.bot.send_message(chat_id=user_id, text=response_text)
@@ -240,12 +242,14 @@ async def track_used_link(update: Update, context: CallbackContext):
     return
 
 
-# @private_bot_chat_check handled at task creation
 async def handle_message(update: Update, context: CallbackContext) -> None:
     try:
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        if chat_id not in cached_active_chats.keys():
+        chat_type = update.effective_chat.type
+
+        # If not a private bot chat, and the chat is not in the active_chats list, add it
+        if chat_type != ChatType.PRIVATE and chat_id not in cached_active_chats.keys():
             chat_title = update.effective_chat.title
             cached_active_chats[chat_id] = chat_title
             db.record_active_chat(chat_id, chat_title)
