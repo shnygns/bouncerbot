@@ -1,0 +1,13 @@
+2024-04-29 08:26:43,789 [WARNING] Chat -1002084167369 (Outstanding Group Links) added to active_chats.
+2024-04-29 08:29:22,573 [WARNING] Chat -1002072519400 (Auto1) added to active_chats.
+2024-04-29 10:18:46,349 [WARNING] Invite link https://t.me/+Ujlw5Yq6nII1ZTQ0 was used by Shinanygans Rising (ID: 6940752119)
+2024-04-29 10:28:57,026 [WARNING] Invite link https://t.me/+IWosFsehyl8zOGU0 was used by TonyStark-ish Shinanygans (ID: 6948715768)
+2024-04-29 10:32:54,343 [WARNING] An error occurred in export_all_users_to_csv(): dict contains fields not in fieldnames: 'username', 'access_granted', 'full_name', 'last_uploaded_video', 'invite_link', 'last_accessed_bot', 'chat_id', 'link_used', 'number_videos_uploaded'
+2024-04-29 10:52:45,842 [WARNING] Invite link https://t.me/+bt6vhNSkG0U2MTQ0 was used by Shinanygans Rising (ID: 6940752119)
+2024-04-29 11:25:12,381 [WARNING] Chat -1002072519400 removed from active chats and all user data deleted.
+2024-04-29 11:29:39,080 [WARNING] Chat -1002084167369 (Outstanding Group Links)removed from active chats and all user data deleted.
+2024-04-29 11:31:37,544 [WARNING] Chat -1002084167369 (Outstanding Group Links) added to active_chats.
+2024-04-29 14:06:08,295 [WARNING] Chat 6940752119 (None) added to active_chats.
+2024-04-29 14:16:34,309 [WARNING] Chat 7177563187 (None) added to active_chats.
+2024-04-29 15:06:30,736 [WARNING] Chat -1002072519400 (Auto1) added to active_chats.
+2024-04-29 21:20:08,502 [WARNING] Invite link https://t.me/+k6C6Y-07f2BhZmU0 was used by Sinless V2 (ID: 7051274674)

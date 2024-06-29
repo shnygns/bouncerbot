@@ -152,6 +152,22 @@ class Database(object):
         else:
             raise Exception("Error recording bot access time")
         return success
+
+
+    def delete_user(self, user_id) -> bool:
+        """delete user from database"""
+        query = """
+                DELETE FROM users_requesting_entry
+                WHERE user_id = ?
+                """
+        params = (user_id,)
+        success = self._execute(query, params)
+        if success:
+            self._commit()
+        else:
+            raise Exception("Error deleting user")
+        return success
+    
     
     def record_video_upload(self, user_id) -> bool:
 

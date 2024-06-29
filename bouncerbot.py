@@ -255,7 +255,8 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
             db.record_active_chat(chat_id, chat_title)
             logging.warning(f"Chat {chat_id} ({chat_title}) added to active_chats.")
 
-        if update.effective_message.video:
+        # If the chat is private, and the message contains a video, increment the user's video count
+        if chat_type == ChatType.PRIVATE and update.effective_message.video:
             num_uploads = db.record_video_upload(user_id)
             if num_uploads >= UPLOADS_NEEDED:
                 invite_link = await request_invite_link(update, context)
@@ -276,7 +277,7 @@ def get_user_details(update) -> tuple:
 
 
 async def send_no_active_chat_message(context, user_id, full_name) -> None:
-    response_text = f"Welcome back, {full_name}! You have already been granted access. Currently, there is no active chat to link to. Please check back later."
+    response_text = f"Welcome back, {full_name}! Currently, there is no active chat to link to. Please check back later."
     await context.bot.send_message(
         chat_id=user_id,
         text=f"<i style='color:#808080;'>{response_text}</i>",
@@ -424,7 +425,11 @@ async def start_command(update: Update, context: CallbackContext) -> None:
         db_user = db.lookup_user(user_id)
         num_uploads = 0
         destination_chat_id = db.lookup_setting("destination_chat_id")
-        chat = await bouncerbot.get_chat(destination_chat_id) if destination_chat_id else None
+        try:
+            chat = await bouncerbot.get_chat(destination_chat_id) if destination_chat_id else None
+        except BadRequest as e:
+            chat = None
+            db.update_settings("destination_chat_id", None)
 
         if not chat:
             await send_no_active_chat_message(context, user_id, full_name)
@@ -571,6 +576,19 @@ async def clean_database(update: Update, context: CallbackContext):
         logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
     return
 
+
+async def reset_me(update: Update, context: CallbackContext):
+    try:
+        user_id = update.effective_user.id
+        db.delete_user(user_id)
+        response_text = "User data deleted."
+        await context.bot.send_message(chat_id=user_id, text=response_text)
+    except Exception as e:
+        tb = traceback.format_exc()
+        _, _, exc_traceback = sys.exc_info()
+        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+    return
+
 '''
 async def drop_table(update: Update, context: CallbackContext):
     # Get the chat ID
@@ -615,6 +633,13 @@ async def export_loop(update: Update, context: CallbackContext):
     return
 
 
+@private_bot_chat_check
+@authorized_admin_check
+async def reset_me_loop(update: Update, context: CallbackContext):
+    asyncio.create_task(reset_me(update, context))
+    return
+
+
 async def post_init(application: Application):
     asyncio.create_task(cache_chats_on_startup())
 
@@ -628,6 +653,15 @@ async def cache_chats_on_startup():
         except (BadRequest, Forbidden) as e:
             logging.warning(f"Chat {chat_id} ({chat_title}) is not accessible. Removing from active_chats.")
             await clean_inactive_chats(chat_id)
+
+        destination_chat_id = db.lookup_setting("destination_chat_id")
+        if not destination_chat_id:
+            return
+        try:
+            await bouncerbot.get_chat(destination_chat_id)  # Test to see if chat is active
+        except (BadRequest, Forbidden) as e:
+            logging.warning(f"Destination chat {destination_chat_id} is not accessible. Removing from settings.")
+            db.update_settings("destination_chat_id", None)
     return
 
 #############  MAIN FUNCTION  #############
@@ -642,6 +676,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("csv", export_loop))
     application.add_handler(CommandHandler("cleandb", clean_database_loop))
+    application.add_handler(CommandHandler("reset", reset_me_loop))
     application.add_handler(CommandHandler("register", register_destination_chat_loop))
     # application.add_handler(CommandHandler("drop", drop_table))
     application.add_handler(ChatMemberHandler(track_used_link, ChatMemberHandler.CHAT_MEMBER))
