@@ -290,7 +290,7 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
             logging.warning(f"User {user_id} uploaded a video. Total uploads: {num_uploads}")
 
             if num_uploads >= UPLOADS_NEEDED:
-                if db_user is not None and not db_user[6]:
+                if db_user is not None and not db_user[6] and VIDEO_REVIEW_GROUP_ID:
                     await forward_media_to_admin_group(update, context)
                 destination_chat_id = db.lookup_setting("destination_chat_id")
                 logging.warning(f"User {user_id} has met the upload requirement.")
