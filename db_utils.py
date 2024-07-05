@@ -65,6 +65,7 @@ class Database(object):
                 invite_link STRING,
                 link_used TIMESTAMP,         
                 chat_id INTEGER,
+                banned BOOLEAN DEFAULT FALSE,
                 PRIMARY KEY (user_id)
             )
         """
@@ -76,6 +77,10 @@ class Database(object):
         if 'chat_id' not in columns:
             # If the column doesn't exist, add it to the table
             self.cur.execute(f"ALTER TABLE users_requesting_entry ADD COLUMN chat_id INTEGER")
+
+        if 'banned' not in columns:
+            # If the column doesn't exist, add it to the table
+            self.cur.execute(f"ALTER TABLE users_requesting_entry ADD COLUMN banned BOOLEAN DEFAULT FALSE")
 
 
         self.cur.execute("""
@@ -91,6 +96,18 @@ class Database(object):
             CREATE TABLE IF NOT EXISTS settings (
                 setting STRING PRIMARY KEY,
                 value VARCHAR(255)
+            )
+        """
+        )
+
+
+        self.cur.execute("""
+            CREATE TABLE IF NOT EXISTS uploaded_videos (
+                user_id INTEGER,
+                file_id STRING,
+                chat_id INTEGER,
+                upload_time TIMESTAMP,
+                PRIMARY KEY (user_id, file_id)
             )
         """
         )
@@ -162,7 +179,14 @@ class Database(object):
                 """
         params = (user_id,)
         success = self._execute(query, params)
-        if success:
+        query = """
+                DELETE FROM uploaded_videos
+                WHERE user_id = ?
+                """
+        params = (user_id,)
+        success_2 = self._execute(query, params)
+
+        if success and success_2:
             self._commit()
         else:
             raise Exception("Error deleting user")
@@ -192,17 +216,18 @@ class Database(object):
         return number_videos_uploaded
     
 
-    def record_access_granted(self, user_id, invite_link) -> bool:
+    def record_access_granted(self, user_id, invite_link, chat_id) -> bool:
         """record access granted time for user"""
         query = """
-                INSERT INTO users_requesting_entry (user_id, access_granted, invite_link)
-                VALUES (?, ?, ?)
+                INSERT INTO users_requesting_entry (user_id, access_granted, invite_link, chat_id)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE
                 SET access_granted = EXCLUDED.access_granted,
                     invite_link = EXCLUDED.invite_link,
-                    link_used = NULL
+                    link_used = NULL,
+                    chat_id = EXCLUDED.chat_id
                 """
-        params =  (user_id, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"), invite_link)
+        params =  (user_id, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"), invite_link, chat_id)
         success = self._execute(query, params)
         if success:
             self._commit()
@@ -334,6 +359,52 @@ class Database(object):
             return result[0] if result[0] else None
         else:
             raise Exception("Error looking up active chat")
+
+
+    def lookup_chat_id_for_user(self, user_id) -> Tuple:
+        """lookup active chat in database"""
+        query = """
+                SELECT chat_id FROM users_requesting_entry
+                WHERE user_id = ?
+                """
+        params = (user_id,)
+        success = self._execute(query, params)
+        result = self.cur.fetchone()
+        if success:
+            return result[0] if result[0] else None
+        else:
+            raise Exception("Error looking up active chat")
+
+    
+    def record_banned_user(self, user_id) -> bool:
+        """record banned user in database"""
+        query = """
+                UPDATE users_requesting_entry
+                SET banned = TRUE
+                WHERE user_id = ?
+                """
+        params = (user_id,)
+        success = self._execute(query, params)
+        if success:
+            self._commit()
+        else:
+            raise Exception("Error recording banned user")
+        return success
+
+
+    def lookup_is_user_banned(self, user_id) -> bool:
+        """lookup banned user in database"""
+        query = """
+                SELECT banned FROM users_requesting_entry
+                WHERE user_id = ?
+                """
+        params = (user_id,)
+        success = self._execute(query, params)
+        result = self.cur.fetchone()
+        if success:
+            return result[0] if result else None
+        else:
+            raise Exception("Error looking up banned user")
         
     
     def return_all_users(self) -> List[Tuple]:
@@ -403,3 +474,25 @@ class Database(object):
             self._commit()
         else:
             raise Exception("Error dropping table")
+
+
+    def store_uploaded_video(self, user_id: int, file_id: str, chat_id: int) -> None:
+        query = """
+            INSERT INTO uploaded_videos (user_id, file_id, chat_id, upload_time)
+            VALUES (?, ?, ?, datetime('now'))
+        """
+        params = (user_id, file_id, chat_id)
+        self._execute(query, params)
+        self._commit()
+
+
+    def get_recent_videos(self, user_id: int, uploads_needed: int) -> List[str]:
+        query = """
+            SELECT file_id FROM uploaded_videos
+            WHERE user_id = ?
+            ORDER BY upload_time DESC
+            LIMIT ?
+        """
+        params = (user_id, uploads_needed)
+        self._execute(query, params)
+        return [row[0] for row in self.cur.fetchall()]

@@ -18,7 +18,9 @@ import asyncio
 import csv
 from collections import OrderedDict
 from functools import wraps
-from telegram import Update, ChatMember, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telethon.sync import TelegramClient
+from telethon.tl.types import MessageMediaDocument
+from telegram import Update, ChatMember, Message, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
 from telegram.constants import ChatType, ParseMode
 from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkError
 from telegram.ext import (
@@ -39,7 +41,8 @@ from config import (
     MINUTES_TO_LINK_EXPIRATION,
     UPLOADS_NEEDED,
     HELP_MESSAGE,
-    SETUP_MESSAGE
+    SETUP_MESSAGE,
+    VIDEO_REVIEW_GROUP_ID
 )
 
 
@@ -75,6 +78,23 @@ app = None
 db = Database()
 utc_timezone = pytz.utc
 cached_active_chats = {}
+
+
+
+def user_not_banned(handler_function):
+    @wraps(handler_function)
+    async def wrapper(update: Update, context: CallbackContext):
+        try:
+            user_id = update.effective_user.id
+            is_banned = db.lookup_is_user_banned(user_id)
+            if is_banned:
+                return
+            else:
+                return await handler_function(update, context)
+        except Exception as e:
+            logging.warning(f"An error occured in authorized_admin_check(): {e}")
+            return
+    return wrapper
 
 
 # Custom decorator function to check if the requesting user is authorized (use for commands).
@@ -247,6 +267,11 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         chat_type = update.effective_chat.type
+        db_user = db.lookup_user(user_id)
+
+        is_banned = db.lookup_is_user_banned(user_id)
+        if is_banned:
+            return
 
         # If not a private bot chat, and the chat is not in the active_chats list, add it
         if chat_type != ChatType.PRIVATE and chat_id not in cached_active_chats.keys():
@@ -257,16 +282,91 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
 
         # If the chat is private, and the message contains a video, increment the user's video count
         if chat_type == ChatType.PRIVATE and update.effective_message.video:
-            num_uploads = db.record_video_upload(user_id)
-            if num_uploads >= UPLOADS_NEEDED:
-                invite_link = await request_invite_link(update, context)
-                db.record_access_granted(user_id, invite_link)
 
+            # Store the uploaded video in the database
+            video_file_id = update.message.video.file_id
+            db.store_uploaded_video(user_id, video_file_id, chat_id)
+            num_uploads = db.record_video_upload(user_id)
+            logging.warning(f"User {user_id} uploaded a video. Total uploads: {num_uploads}")
+
+            if num_uploads >= UPLOADS_NEEDED:
+                if db_user is not None and not db_user[6]:
+                    await forward_media_to_admin_group(update, context)
+                destination_chat_id = db.lookup_setting("destination_chat_id")
+                logging.warning(f"User {user_id} has met the upload requirement.")
+                invite_link = await request_invite_link(update, context)
+                db.record_access_granted(user_id, invite_link, destination_chat_id)
 
     except Exception as e:
         tb = traceback.format_exc()
         logging.error(f"An error occurred in handle_message(): {e}\n{tb}")
     return
+
+
+async def forward_media_to_admin_group(update: Update, context: CallbackContext):
+    try:
+        admin_group_id = VIDEO_REVIEW_GROUP_ID
+        user_id, full_name, username = get_user_details(update)
+
+        # Collect recent videos from the database
+        media_files = db.get_recent_videos(user_id, UPLOADS_NEEDED)
+
+        if not media_files:
+            logging.error(f"No media files found for user {user_id}")
+            return
+
+        # Collect media into an album
+        media_group = [InputMediaVideo(media=file_id) for file_id in media_files]
+
+        # Forward the album to the admin group
+        if len(media_group) > 1:
+            await context.bot.send_media_group(chat_id=admin_group_id, media=media_group)
+        else:
+            await context.bot.send_video(chat_id=admin_group_id, video=media_group[0].media)
+
+        # Add inline keyboard with "Ban User" button
+        keyboard = [[InlineKeyboardButton(f"Ban {full_name}", callback_data=f"ban_user:{user_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(chat_id=admin_group_id, text=f"{full_name}{' (@'+username + ')' if username else ''}", reply_markup=reply_markup)
+
+    except Exception as e:
+        logging.error(f"Error forwarding media to admin group: {e}")
+    return
+
+async def ban_user(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        # Check if the user pressing the button is an authorized admin
+        pressing_user_id = query.from_user.id
+        if pressing_user_id not in AUTHORIZED_ADMINS:
+            await context.bot.send_message(chat_id = VIDEO_REVIEW_GROUP_ID, text="You are not authorized to perform this action.")
+            logging.warning(f"Unauthorized ban attempt by user {pressing_user_id}")
+            return
+
+        # Extract user_id from callback_data
+        data = query.data.split(':')
+        user_id = int(data[1])
+        chat_id = db.lookup_chat_id_for_user(user_id)
+
+        if chat_id and user_id not in AUTHORIZED_ADMINS:
+            # Ban the user
+            try:
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+            except Exception as e:
+                logging.warning(f"Error banning user: {e}")
+            db.record_banned_user(user_id)
+            # Edit the existing message text and remove the button
+            await query.edit_message_text(text=f"User {user_id} has been successfully banned.")
+            logging.warning(f"User {user_id} banned from chat {chat_id}")
+        else:
+            await query.edit_message_text(text="Failed to find the chat to ban the user.")
+            logging.error(f"Chat ID for user {user_id} not found.")
+
+    except Exception as e:
+        logging.error(f"Error banning user: {e}")
+        await query.edit_message_text(text="Failed to ban the user.")
 
 
 def get_user_details(update) -> tuple:
@@ -309,7 +409,8 @@ async def generate_start_command_response_text(db_user, num_uploads, user_id, fu
         if invite_link is None:
             response_text = f"Welcome back, {full_name}! You have already been granted access. Currently, there is no active chat to link to. Please check back later."
         else:
-            db.record_access_granted(user_id, invite_link)
+            destination_chat_id = db.lookup_setting("destination_chat_id")
+            db.record_access_granted(user_id, invite_link, destination_chat_id)
             response_text = f"Welcome back, {full_name}! You have already been granted access. Here is your invite link:\n{invite_link}\n\n"
             if MINUTES_TO_LINK_EXPIRATION:
                 response_text += f"This link will expire in {MINUTES_TO_LINK_EXPIRATION} minutes."
@@ -415,6 +516,7 @@ def sanitize_filename(filename):
 
 #############  COMMAND HANDLING FUNCTIONS  #############
 
+@user_not_banned
 @private_bot_chat_check
 async def start_command(update: Update, context: CallbackContext) -> None:
     """Send a message with information about the bot's available commands."""
@@ -455,6 +557,7 @@ async def start_command(update: Update, context: CallbackContext) -> None:
 
 
 @private_bot_chat_check
+@user_not_banned
 async def help_command(update: Update, context: CallbackContext) -> None:
     """Send a message with information about the bot's available commands."""
     # If the user_id is in AUTHORIZED_ADMINS, send the setup message. Otherwise, send the help message
@@ -634,7 +737,6 @@ async def export_loop(update: Update, context: CallbackContext):
 
 
 @private_bot_chat_check
-@authorized_admin_check
 async def reset_me_loop(update: Update, context: CallbackContext):
     asyncio.create_task(reset_me(update, context))
     return
@@ -681,12 +783,12 @@ def main() -> None:
     # application.add_handler(CommandHandler("drop", drop_table))
     application.add_handler(ChatMemberHandler(track_used_link, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(button_click, pattern='^activechats_.*'))
+    application.add_handler(CallbackQueryHandler(ban_user, pattern=r'^ban_user:'))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
 
     try:
         bouncerbot = application.bot
         app = application
-
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         print(e)
