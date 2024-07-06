@@ -778,7 +778,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("csv", export_loop))
     application.add_handler(CommandHandler("cleandb", clean_database_loop))
-    application.add_handler(CommandHandler("reset", reset_me_loop))
+    # application.add_handler(CommandHandler("reset", reset_me_loop))
     application.add_handler(CommandHandler("register", register_destination_chat_loop))
     # application.add_handler(CommandHandler("drop", drop_table))
     application.add_handler(ChatMemberHandler(track_used_link, ChatMemberHandler.CHAT_MEMBER))
