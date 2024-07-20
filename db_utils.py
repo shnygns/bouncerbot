@@ -105,12 +105,20 @@ class Database(object):
             CREATE TABLE IF NOT EXISTS uploaded_videos (
                 user_id INTEGER,
                 file_id STRING,
+                unique_file_id STRING,
                 chat_id INTEGER,
                 upload_time TIMESTAMP,
                 PRIMARY KEY (user_id, file_id)
             )
         """
         )
+
+        self.cur.execute(f"PRAGMA table_info(uploaded_videos)")
+        columns = [column[1] for column in self.cur.fetchall()]
+
+        if 'unique_file_id' not in columns:
+            # If the column doesn't exist, add it to the table
+            self.cur.execute(f"ALTER TABLE uploaded_videos ADD COLUMN unique_file_id STRING")
 
         self._commit()
 
@@ -476,14 +484,19 @@ class Database(object):
             raise Exception("Error dropping table")
 
 
-    def store_uploaded_video(self, user_id: int, file_id: str, chat_id: int) -> None:
-        query = """
-            INSERT INTO uploaded_videos (user_id, file_id, chat_id, upload_time)
-            VALUES (?, ?, ?, datetime('now'))
-        """
-        params = (user_id, file_id, chat_id)
-        self._execute(query, params)
-        self._commit()
+    def store_uploaded_video(self, user_id: int, file_id: str, unique_file_id: str, chat_id: int) -> None:
+        try:
+            query = """
+                INSERT INTO uploaded_videos (user_id, file_id, unique_file_id, chat_id, upload_time)
+                VALUES (?, ?, ?, ?, datetime('now'))
+            """
+            params = (user_id, file_id, unique_file_id, chat_id)
+            self._execute(query, params)
+            self._commit()
+            return True
+        except Exception as e:
+            logging.error(f"Error storing uploaded video: {e}")
+            return False
 
 
     def get_recent_videos(self, user_id: int, uploads_needed: int) -> List[str]:
@@ -496,3 +509,13 @@ class Database(object):
         params = (user_id, uploads_needed)
         self._execute(query, params)
         return [row[0] for row in self.cur.fetchall()]
+    
+
+    def file_id_already_uploaded(self, user_id: int, unique_file_id: str) -> bool:
+        query = """
+            SELECT * FROM uploaded_videos
+            WHERE user_id = ? AND unique_file_id = ?
+        """
+        params = (user_id, unique_file_id)
+        self._execute(query, params)
+        return self.cur.fetchone() is not None

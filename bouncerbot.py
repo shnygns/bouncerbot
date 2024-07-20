@@ -10,28 +10,24 @@ This bot will as for a sample media contribution before responding with a link t
 import logging
 import re
 import sys
+import inspect
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta, timezone
-import traceback
 import pytz
 import asyncio
 import csv
-from collections import OrderedDict
 from functools import wraps
-from telethon.sync import TelegramClient
-from telethon.tl.types import MessageMediaDocument
-from telegram import Update, ChatMember, Message, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
 from telegram.constants import ChatType, ParseMode
 from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkError
 from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
     MessageHandler,
     filters,
     CallbackContext,
-    Application
+    Application,
 )
 from db_utils import Database
 from config import (
@@ -79,8 +75,27 @@ db = Database()
 utc_timezone = pytz.utc
 cached_active_chats = {}
 
+# Dictionary to keep track of media groups that have been processed
+processed_media_groups = {}
 
 
+########## ERROR HANDLING ##########
+def handle_error(exception: Exception):
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    current_frame = inspect.currentframe()
+    caller_frame = current_frame.f_back if current_frame else None
+    function_name = caller_frame.f_code.co_name if caller_frame else 'Unknown'
+    
+    logging.warning(
+        f"Error in function '{function_name}' - {exception}. "
+        f"Exception Raised In: {exc_traceback.tb_frame.f_code.co_name} - "
+        f"Line: {exc_traceback.tb_lineno} - "
+        f"Type: {exc_type}. "
+
+    )
+    return
+
+########## WRAPPERS ##########
 def user_not_banned(handler_function):
     @wraps(handler_function)
     async def wrapper(update: Update, context: CallbackContext):
@@ -92,7 +107,7 @@ def user_not_banned(handler_function):
             else:
                 return await handler_function(update, context)
         except Exception as e:
-            logging.warning(f"An error occured in authorized_admin_check(): {e}")
+            handle_error(e)
             return
     return wrapper
 
@@ -109,7 +124,7 @@ def authorized_admin_check(handler_function):
                 return await handler_function(update, context)
 
         except Exception as e:
-            logging.warning(f"An error occured in authorized_admin_check(): {e}")
+            handle_error(e)
             return
     return wrapper
 
@@ -124,11 +139,19 @@ def private_bot_chat_check(handler_function):
             else:
                 return await handler_function(update, context)
         except Exception as e:
-            logging.warning(f"An error occured in private_bot_chat_check(): {e}")
+            handle_error(e)
             return
     return wrapper
 
 
+def get_user_details(update) -> tuple:
+    user_id = update.effective_user.id
+    full_name = update.effective_user.full_name
+    username = update.effective_user.username
+    return user_id, full_name, username
+
+
+########## SYNCHRONOUS UTILITIES ##########
 def parse_date_from_db(date_str):
     return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone) if date_str else None
 
@@ -180,23 +203,12 @@ def create_keyboard_from_active_chats():
     return reply_markup, button_names
 
 
-async def list_active_chats():
+def list_active_chats():
     response_text = "ACTIVE CHATS:\n\n"
     active_chats = db.return_all_active_chats()
     for chat_id, chat_title in active_chats.items():
         response_text += f"{chat_id} - {chat_title}\n"
     return response_text
-
-
-async def create_one_time_invite_link() -> str:
-    # Create a new invite link that can only be used once
-    destination_chat_id = db.lookup_setting("destination_chat_id")
-    if destination_chat_id is None:
-        return None
-    expire_time = int((datetime.now() + timedelta(minutes=MINUTES_TO_LINK_EXPIRATION)).timestamp()) if MINUTES_TO_LINK_EXPIRATION else None
-    invite_creation_response = await bouncerbot.create_chat_invite_link(int(destination_chat_id), member_limit=1, expire_date=expire_time)
-    invite_link = invite_creation_response.invite_link
-    return invite_link
 
 
 def extract_callback_data(data):
@@ -218,30 +230,58 @@ def handle_choice(choice, button_names):
     return message_text
 
 
-async def request_invite_link(update: Update, context: CallbackContext) -> str:
+
+
+
+########## ASYNCHRONOUS UTILITIES ##########
+async def create_one_time_invite_link() -> str:
+    try:
+        # Create a new invite link that can only be used once
+        destination_chat_id = db.lookup_setting("destination_chat_id")
+        if destination_chat_id is None:
+            return None
+        expire_time = int((datetime.now() + timedelta(minutes=MINUTES_TO_LINK_EXPIRATION)).timestamp()) if MINUTES_TO_LINK_EXPIRATION else None
+        invite_creation_response = await bouncerbot.create_chat_invite_link(int(destination_chat_id), member_limit=1, expire_date=expire_time)
+        invite_link = invite_creation_response.invite_link
+        return invite_link
+    except Exception as e:
+        handle_error(e)
+        return None
+
+
+async def request_invite_link(context: CallbackContext, user_specs) -> str:
     # Get the chat ID
-    user_id = update.effective_user.id
+    user_id, _, _= user_specs
+    try:
+        # Create a one-time invite link
+        invite_link = await create_one_time_invite_link()
+        if invite_link is None:
+            response_text = "Currently, there is no active chat to link to. Please check back later."
+        else:
+            response_text = f"Here is your one-time invite link: {invite_link}"
+            if MINUTES_TO_LINK_EXPIRATION:
+                response_text += f"\n\nThis link will expire in {MINUTES_TO_LINK_EXPIRATION} minutes."
 
-    # Create a one-time invite link
-    invite_link = await create_one_time_invite_link()
-    if invite_link is None:
-        response_text = "Currently, there is no active chat to link to. Please check back later."
-    else:
-        response_text = f"Here is your one-time invite link: {invite_link}"
-        if MINUTES_TO_LINK_EXPIRATION:
-            response_text += f"\n\nThis link will expire in {MINUTES_TO_LINK_EXPIRATION} minutes."
-
-    # Send the invite link to the user
-    await context.bot.send_message(chat_id=user_id, text=response_text)
-    return invite_link
+        # Send the invite link to the user
+        await context.bot.send_message(chat_id=user_id, text=response_text)
+        return invite_link
+    except Exception as e:
+        handle_error(e)
+        return None
 
 
 async def send_confirmation_and_delete_original(bot, chat_id, user_id, message_id, message_text):
-    await bot.send_message(chat_id=chat_id, text=message_text, parse_mode=ParseMode.HTML)
-    await asyncio.sleep(3)
-    await bot.delete_message(chat_id=user_id, message_id=message_id)
+    try:
+        await bot.send_message(chat_id=chat_id, text=message_text, parse_mode=ParseMode.HTML)
+        await asyncio.sleep(3)
+        await bot.delete_message(chat_id=user_id, message_id=message_id)
+    except Exception as e:
+        handle_error(e)
     return
 
+
+
+########## HANDLERS ##########
 
 async def track_used_link(update: Update, context: CallbackContext):
     # if this is a 'join by invite link' event, update.chat_member.invite_link will contain the invite link used
@@ -280,33 +320,161 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
             db.record_active_chat(chat_id, chat_title)
             logging.warning(f"Chat {chat_id} ({chat_title}) added to active_chats.")
 
-        # If the chat is private, and the message contains a video, increment the user's video count
-        if chat_type == ChatType.PRIVATE and update.effective_message.video:
-
-            # Store the uploaded video in the database
-            video_file_id = update.message.video.file_id
-            db.store_uploaded_video(user_id, video_file_id, chat_id)
-            num_uploads = db.record_video_upload(user_id)
-            logging.warning(f"User {user_id} uploaded a video. Total uploads: {num_uploads}")
-
-            if num_uploads >= UPLOADS_NEEDED:
-                if db_user is not None and not db_user[6] and VIDEO_REVIEW_GROUP_ID:
-                    await forward_media_to_admin_group(update, context)
-                destination_chat_id = db.lookup_setting("destination_chat_id")
-                logging.warning(f"User {user_id} has met the upload requirement.")
-                invite_link = await request_invite_link(update, context)
-                db.record_access_granted(user_id, invite_link, destination_chat_id)
-
     except Exception as e:
-        tb = traceback.format_exc()
-        logging.error(f"An error occurred in handle_message(): {e}\n{tb}")
+        handle_error(e)
     return
 
 
-async def forward_media_to_admin_group(update: Update, context: CallbackContext):
+async def handle_video_upload(update: Update, context: CallbackContext):
+    user_id, full_name, username = get_user_details(update)
+    user_specs = (user_id, full_name, username)
+    chat_id = update.message.chat_id
+    chat_type = update.effective_chat.type
+    video_file_id = update.message.video.file_id
+    video_file_unique_id = update.message.video.file_unique_id
+    media_group_id = update.message.media_group_id
+
+
+    async def process_as_media_group(update, context):  
+            try:
+                message = update.effective_message
+                if message.media_group_id:
+                    msg_dict = {"user_id": user_id, "full_name": full_name, "username": username, "chat_id": chat_id, "video_file_id": video_file_id, "video_file_unique_id": video_file_unique_id}
+                    jobs = context.job_queue.get_jobs_by_name(str(message.media_group_id)) if context.job_queue else None
+                    if jobs:
+                        jobs[0].data.append(msg_dict)
+                    else:
+                        context.job_queue.run_once(callback=handle_media_group, when=1.2, data=[msg_dict],
+                                            name=str(message.media_group_id))
+            except Exception as e:
+                handle_error(e)
+            return
+    try:
+        if chat_type != ChatType.PRIVATE:
+            return
+        
+        # Check if the user is banned
+        is_banned = db.lookup_is_user_banned(user_id)
+        if is_banned:
+            return
+
+        if media_group_id:
+            return await process_as_media_group(update, context)
+        
+        if db.file_id_already_uploaded(user_id, video_file_unique_id):
+            await context.bot.send_message(chat_id=user_id, text="You have already uploaded this video.")
+            logging.warning(f"User {user_id} attempted to upload a duplicate video.")
+            return
+
+        # Store the uploaded video in the database
+        upload_success = db.store_uploaded_video(user_id, video_file_id, video_file_unique_id, chat_id)
+        if not upload_success:
+            await context.bot.send_message(chat_id=user_id, text="You have already uploaded this video.")
+            logging.warning(f"User {user_id} attempted to upload a duplicate video.")
+            return
+        num_uploads = db.record_video_upload(user_id)
+        logging.warning(f"User {user_id} uploaded a video. Total uploads: {num_uploads}")
+        await assess_upload_threshold(context, user_specs)
+    except Exception as e:
+        handle_error(e)
+    return
+
+
+async def assess_upload_threshold(context, user_specs):
+    try:
+        user_id, full_name, _ = user_specs
+        db_user = db.lookup_user(user_id)
+        db_user_dict = parse_user_tuple_list_from_db([db_user])
+        response_text = ""
+        num_uploads = db_user_dict[user_id]['number_videos_uploaded']
+        # Check if user has uploaded enough videos
+        if num_uploads >= UPLOADS_NEEDED and not db_user_dict[user_id]['access_granted']:   
+            await grant_access_to_user(context, user_specs)
+
+        elif num_uploads >= UPLOADS_NEEDED and db_user_dict[user_id]['access_granted']:
+            invite_link = db_user_dict[user_id]['invite_link']
+            link_creation_time = db_user_dict[user_id]['access_granted']
+            response_text = await generate_existing_link_response_text(full_name, invite_link, link_creation_time)
+            logging.warning(f"User {user_id} has met the upload requirement.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"<i style='color:#808080;'>{response_text}</i>",
+                parse_mode=ParseMode.HTML
+            )
+
+        else:
+            response_text += f"Thank you. You have uploaded {num_uploads} out of {UPLOADS_NEEDED} required media files." if UPLOADS_NEEDED >0 else ""
+            logging.warning(f"User {user_id} has uploaded {num_uploads} out of {UPLOADS_NEEDED} required media files.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"<i style='color:#808080;'>{response_text}</i>",
+                parse_mode=ParseMode.HTML
+            )
+    except Exception as e:
+        handle_error(e)
+    return
+
+
+async def handle_media_group(context: CallbackContext):
+    try:
+        media = context.job.data
+        if not media:
+            return
+        num_uploads = 0
+        user_id = None
+        full_name = None
+        username = None
+        chat_id = None
+        duplicates = 0
+        for msg_dict in media:
+            user_id = msg_dict["user_id"] if not user_id else user_id
+            full_name = msg_dict["full_name"] if not full_name else full_name
+            username = msg_dict["username"] if not username else username
+            chat_id = msg_dict["chat_id"] if not chat_id else chat_id
+            video_file_id = msg_dict["video_file_id"] 
+            video_file_unique_id = msg_dict["video_file_unique_id"] 
+            if db.file_id_already_uploaded(user_id, video_file_unique_id):
+                duplicates +=1
+                continue
+            upload_success = db.store_uploaded_video(user_id, video_file_id, video_file_unique_id, chat_id)
+            if not upload_success:
+                duplicates +=1
+                continue
+            num_uploads = db.record_video_upload(user_id)
+            logging.warning(f"User {user_id} uploaded a video. Total uploads: {num_uploads}")
+
+        user_specs = (user_id, full_name, username)
+        if duplicates > 0:
+            await context.bot.send_message(chat_id=user_id, text=f"{duplicates} videos were duplicates and not counted.")
+        await assess_upload_threshold(context, user_specs)
+    except Exception as e:
+        handle_error(e)
+    return
+
+
+async def grant_access_to_user(context, user_specs):
+    user_id, full_name, username = user_specs
+    db_user = db.lookup_user(user_id)
+    try:
+
+        #If the user exists in the database and has not been granted access, forward their media to the admin group
+        if db_user is not None and not db_user[6] and VIDEO_REVIEW_GROUP_ID:
+            asyncio.create_task(forward_media_to_admin_group(context, user_specs))
+
+        # Create a one-time invite link
+        destination_chat_id = db.lookup_setting("destination_chat_id")
+        logging.warning(f"User {user_id} has met the upload requirement.")
+        invite_link = await request_invite_link(context, user_specs)
+        db.record_access_granted(user_id, invite_link, destination_chat_id)
+    except Exception as e:
+        handle_error(e)
+    return
+
+
+async def forward_media_to_admin_group( context: CallbackContext, user_specs):
     try:
         admin_group_id = VIDEO_REVIEW_GROUP_ID
-        user_id, full_name, username = get_user_details(update)
+        user_id, full_name, username = user_specs
 
         # Collect recent videos from the database
         media_files = db.get_recent_videos(user_id, UPLOADS_NEEDED)
@@ -330,8 +498,9 @@ async def forward_media_to_admin_group(update: Update, context: CallbackContext)
         await context.bot.send_message(chat_id=admin_group_id, text=f"{full_name}{' (@'+username + ')' if username else ''}", reply_markup=reply_markup)
 
     except Exception as e:
-        logging.error(f"Error forwarding media to admin group: {e}")
+        handle_error(e)
     return
+
 
 async def ban_user(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -365,30 +534,26 @@ async def ban_user(update: Update, context: CallbackContext):
             logging.error(f"Chat ID for user {user_id} not found.")
 
     except Exception as e:
-        logging.error(f"Error banning user: {e}")
+        handle_error(e)
         await query.edit_message_text(text="Failed to ban the user.")
-
-
-def get_user_details(update) -> tuple:
-    user_id = update.effective_user.id
-    full_name = update.effective_user.full_name
-    username = update.effective_user.username
-    return user_id, full_name, username
-
-
-async def send_no_active_chat_message(context, user_id, full_name) -> None:
-    response_text = f"Welcome back, {full_name}! Currently, there is no active chat to link to. Please check back later."
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"<i style='color:#808080;'>{response_text}</i>",
-        parse_mode=ParseMode.HTML
-    ) 
     return
 
 
-async def generate_start_command_response_text(db_user, num_uploads, user_id, full_name, destination_chat_id, chat_title) -> str:
+async def send_no_active_chat_message(context, user_id, full_name) -> None:
+    try:
+        response_text = f"Welcome back, {full_name}! Currently, there is no active chat to link to. Please check back later."
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"<i style='color:#808080;'>{response_text}</i>",
+            parse_mode=ParseMode.HTML
+        ) 
+    except Exception as e:
+        handle_error(e)
+    return
 
-    async def generate_existing_link_response_text(full_name, invite_link, link_creation_time):
+
+async def generate_existing_link_response_text(full_name, invite_link, link_creation_time):
+    try:
         response_text = f"Welcome back, {full_name}! You have already been granted access. Here is your invite link:\n{invite_link}\n\n"
         if MINUTES_TO_LINK_EXPIRATION:
             # time_remaining equals the number of minutes reflected in MINUTES_TO_LINK_EXPIRATION, minus the elapsed time beteween now and the link creation time
@@ -402,7 +567,12 @@ async def generate_start_command_response_text(db_user, num_uploads, user_id, fu
             else:
                 response_text += f"This link will expire in {minutes} {'minutes' if minutes > 1 else 'minute'}."
         return response_text
+    except Exception as e:
+        handle_error(e)
+        return None
 
+
+async def generate_start_command_response_text(db_user, num_uploads, user_id, full_name, destination_chat_id, chat_title) -> str:
 
     async def generate_new_link_response_text(user_id, full_name):
         invite_link = await create_one_time_invite_link()
@@ -419,31 +589,33 @@ async def generate_start_command_response_text(db_user, num_uploads, user_id, fu
 
     response_text = f"💥 <strong>Welcome to {chat_title}</strong> 💥\n\n"
     response_text += START_MESSAGE
-
+    try:
     # If user is in the database, check if they have an invite link and if it has been used
-    if db_user is not None:
-        db_user_dict = parse_user_tuple_list_from_db([db_user])
-        access_granted_timestamp = db_user_dict[user_id]['access_granted']
-        invite_link = db_user_dict[user_id]['invite_link']
-        link_used = db_user_dict[user_id]['link_used']
-        link_chat_id = db_user_dict[user_id]['chat_id']
+        if db_user is not None:
+            db_user_dict = parse_user_tuple_list_from_db([db_user])
+            access_granted_timestamp = db_user_dict[user_id]['access_granted']
+            invite_link = db_user_dict[user_id]['invite_link']
+            link_used = db_user_dict[user_id]['link_used']
+            link_chat_id = db_user_dict[user_id]['chat_id']
 
-        #If an invite link exists, has not been used, has not expired, and is for the correct chat, generate a response with the existing link:
-        if invite_link and not link_used and (datetime.now(timezone.utc) - access_granted_timestamp) < timedelta(minutes=MINUTES_TO_LINK_EXPIRATION) and link_chat_id == destination_chat_id:
-            response_text = await generate_existing_link_response_text(full_name, invite_link, access_granted_timestamp)
+            #If an invite link exists, has not been used, has not expired, and is for the correct chat, generate a response with the existing link:
+            if invite_link and not link_used and (datetime.now(timezone.utc) - access_granted_timestamp) < timedelta(minutes=MINUTES_TO_LINK_EXPIRATION) and link_chat_id == destination_chat_id:
+                response_text = await generate_existing_link_response_text(full_name, invite_link, access_granted_timestamp)
 
-        #If the existing link has expired, or there is no existing link but the obligation has been met, generate a new link
-        elif num_uploads >= UPLOADS_NEEDED:
-            response_text = await generate_new_link_response_text(user_id, full_name)
-        #If there is no existing link and the obligation has not been met, inform the user of their progress
-        else:
-            response_text += f"\n\nYou have uploaded {num_uploads} out of {UPLOADS_NEEDED} required media files." if UPLOADS_NEEDED >0 else ""
-    
-    return response_text
+            #If the existing link has expired, or there is no existing link but the obligation has been met, generate a new link
+            elif num_uploads >= UPLOADS_NEEDED:
+                response_text = await generate_new_link_response_text(user_id, full_name)
+            #If there is no existing link and the obligation has not been met, inform the user of their progress
+            else:
+                response_text += f"\n\nYou have uploaded {num_uploads} out of {UPLOADS_NEEDED} required media files." if UPLOADS_NEEDED >0 else ""
+        
+        return response_text
+    except Exception as e:
+        handle_error(e)
+        return None
 
 
 #############  INACTIVE CHAT HANDLING #############
-
 
 async def find_inactive_chats():
     db_chats = db.return_all_active_chats()
@@ -451,7 +623,7 @@ async def find_inactive_chats():
     inactive_chats = []
     for chat_id, chat_title in db_chats.items(): 
         try:
-            await bouncerbot.get_chat(chat_id)  # Test to see if chat is active
+            chat = await bouncerbot.get_chat(chat_id)  # Test to see if chat is active
             active_chats.append(chat_id)
         except (BadRequest, Forbidden) as e:
             logging.warning(f"Chat {chat_id} ({chat_title}) is not accessible. Removing from active_chats.")
@@ -465,28 +637,28 @@ async def clean_inactive_chats(chat_id: int):
         db_users = db.return_users_for_chat(chat_id)
         db_user_dict = parse_user_tuple_list_from_db(db_users)
         chat_title = db.lookup_active_chat_title_with_id(chat_id)
-        await write_users_to_csv(db_user_dict, chat_title)
+        write_users_to_csv(db_user_dict, chat_title)
         
         db.delete_users_for_chat(chat_id)
         db.delete_active_chat(chat_id)
         logging.warning(f"Chat {chat_id} ({chat_title}) removed from active chats and all user data deleted.")
     except Exception as e:
-        logging.warning(f"An error occurred in clean_inactive_chats(): {e}")
+        handle_error(e)
     return
-
-
-async def create_readable_current_date_for_filenames():
-    return datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 
 #############  CSV PROCESSING FUNCTIONS #############
 
 
-async def write_users_to_csv(users_dict, chat_title):
+def create_readable_current_date_for_filenames():
+    return datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+
+def write_users_to_csv(users_dict, chat_title):
     if not users_dict:
         return None  # Return None if the dictionary is empty
 
-    date_string = datetime.now().strftime("%Y%m%d_%H-%M")  # You can adjust the date format as needed
+    date_string = create_readable_current_date_for_filenames()  # You can adjust the date format as needed
     safe_chat_title = sanitize_filename(chat_title)
     file_path = f'users_{safe_chat_title}_{date_string}.csv'
     
@@ -550,9 +722,7 @@ async def start_command(update: Update, context: CallbackContext) -> None:
             parse_mode=ParseMode.HTML
         )  
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 
@@ -570,21 +740,17 @@ async def help_command(update: Update, context: CallbackContext) -> None:
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 
 async def post_active_chats_in_message(update: Update, context: CallbackContext):
     try:
         user_id=update.effective_user.id
-        response_text = await list_active_chats()
+        response_text = list_active_chats()
         await app.bot.send_message(chat_id=user_id, text=response_text)
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 
@@ -604,9 +770,7 @@ async def register_destination_chat(update: Update, context: CallbackContext):
 
 
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 # Callback function for handling button clicks
@@ -634,9 +798,7 @@ async def button_click(update, context):
             logging.error(f" Error with register_destination_chat() confirmation messages: {e}")
 
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 
@@ -657,13 +819,11 @@ async def export_all_users_to_csv(update: Update, context: CallbackContext):
                 reverse=True
             )
             chat_title = db.lookup_active_chat_title_with_id(chat_id)
-            file_path = await write_users_to_csv({uid: dat for uid, dat in sorted_users}, chat_title)
+            file_path = write_users_to_csv({uid: dat for uid, dat in sorted_users}, chat_title)
             await context.bot.send_document(chat_id=update.effective_chat.id, document=open(file_path, 'rb'))
 
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 
@@ -674,9 +834,7 @@ async def clean_database(update: Update, context: CallbackContext):
             await clean_inactive_chats(chat_id)
         await post_active_chats_in_message(update, context)
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 
@@ -687,9 +845,7 @@ async def reset_me(update: Update, context: CallbackContext):
         response_text = "User data deleted."
         await context.bot.send_message(chat_id=user_id, text=response_text)
     except Exception as e:
-        tb = traceback.format_exc()
-        _, _, exc_traceback = sys.exc_info()
-        logging.error(f"An error occurred in {exc_traceback.tb_frame.f_code.co_name} line: {exc_traceback.tb_lineno}: {e}\n{tb}")
+        handle_error(e)
     return
 
 '''
@@ -784,6 +940,7 @@ def main() -> None:
     application.add_handler(ChatMemberHandler(track_used_link, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(button_click, pattern='^activechats_.*'))
     application.add_handler(CallbackQueryHandler(ban_user, pattern=r'^ban_user:'))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video_upload))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
 
     try:
