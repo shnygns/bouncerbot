@@ -341,6 +341,9 @@ async def handle_video_upload(update: Update, context: CallbackContext):
                 if message.media_group_id:
                     msg_dict = {"user_id": user_id, "full_name": full_name, "username": username, "chat_id": chat_id, "video_file_id": video_file_id, "video_file_unique_id": video_file_unique_id}
                     jobs = context.job_queue.get_jobs_by_name(str(message.media_group_id)) if context.job_queue else None
+
+                    # Create a job in the job queue with a list of dictionaries representing each video in the media group
+                    # If the job already exists, append the new video to the list
                     if jobs:
                         jobs[0].data.append(msg_dict)
                     else:
@@ -416,6 +419,7 @@ async def assess_upload_threshold(context, user_specs):
 
 
 async def handle_media_group(context: CallbackContext):
+    # accept a list of dictionaries, each representing a video in the media group
     try:
         media = context.job.data
         if not media:
